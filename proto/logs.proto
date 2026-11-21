@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package logs;
+
+message LogRequest {
+  int64 timestamp = 1;
+  string short_url = 2;
+  string long_url = 3;
+}
+
+message LogResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+service LogService {
+  rpc LogVisit(LogRequest) returns (LogResponse);
+}
