@@ -14,7 +14,7 @@ for path in (ROOT, ROOT / "generated"):
 
 import logs_pb2  # noqa: E402
 import logs_pb2_grpc  # noqa: E402
-from app.db import connection, init_db  # noqa: E402
+from logs_service.db import log_connection, init_log_db  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,7 +26,7 @@ logger = logging.getLogger("logs_service")
 class LogService(logs_pb2_grpc.LogServiceServicer):
     def LogVisit(self, request, context):
         timestamp = request.timestamp or int(time.time())
-        with connection() as conn:
+        with log_connection() as conn:
             conn.execute(
                 "INSERT INTO visits (timestamp, short_url, long_url) VALUES (?, ?, ?)",
                 (timestamp, request.short_url, request.long_url),
@@ -41,7 +41,7 @@ class LogService(logs_pb2_grpc.LogServiceServicer):
 
 
 def serve():
-    init_db()
+    init_log_db()
     port = os.environ.get("GRPC_PORT", "50051")
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     logs_pb2_grpc.add_LogServiceServicer_to_server(LogService(), server)

@@ -12,14 +12,14 @@ if [[ ! -x "$PYTHON" || ! -x "$UVICORN" ]]; then
   exit 1
 fi
 
-DB_PATH="${VERIFY_DB_PATH:-/tmp/url_shortener_verify.db}"
+VERIFY_DIR="$(mktemp -d /tmp/url-shortener-verify-XXXXXX)"
+DB_PATH="$VERIFY_DIR/url_shortener.db"
+export LOG_DB_PATH="$VERIFY_DIR/visits.db"
 GRPC_PORT="${VERIFY_GRPC_PORT:-50061}"
 WEB_PORT="${VERIFY_WEB_PORT:-8010}"
 export DB_PATH
 export GRPC_PORT
 export GRPC_TARGET="localhost:${GRPC_PORT}"
-
-rm -f "$DB_PATH" "$DB_PATH-shm" "$DB_PATH-wal"
 
 GRPC_PID=""
 WEB_PID=""
@@ -33,7 +33,7 @@ cleanup() {
     kill "$GRPC_PID" 2>/dev/null || true
     wait "$GRPC_PID" 2>/dev/null || true
   fi
-  rm -f "$DB_PATH" "$DB_PATH-shm" "$DB_PATH-wal"
+  rm -rf "$VERIFY_DIR"
 }
 trap cleanup EXIT
 
@@ -99,12 +99,15 @@ echo "==> Visitas registradas por gRPC"
 "$PYTHON" - <<'PY'
 from app.db import connection
 from app.db import START_ID
+from logs_service.db import log_connection
 
 with connection() as conn:
     url = conn.execute("SELECT id, hash, long_url FROM urls").fetchone()
     assert url["id"] == START_ID
     assert url["hash"] == "eRgfR"
     assert url["long_url"] == "https://example.com/verificacion"
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'visits'").fetchone()[0] == 0
+with log_connection() as conn:
     rows = conn.execute(
         "SELECT id, timestamp, short_url, long_url FROM visits"
     ).fetchall()

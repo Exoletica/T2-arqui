@@ -7,7 +7,7 @@ import pytest
 from litestar.testing import TestClient
 
 from app import grpc_client, urls
-from app.base62 import decode, encode
+import base62
 from app.db import START_ID, connection
 from app.main import app as app1
 from arquitectura2.main import create_app
@@ -78,11 +78,28 @@ def test_creation_sequence_https_and_no_post_cache(clients):
     client = clients()
     for index in range(3):
         data = shorten(client)
-        assert data == {"hash": encode(START_ID + index),
-                        "short_url": f"https://localhost.local:8444/{encode(START_ID + index)}"}
-        assert decode(data["hash"]) == START_ID + index
+        assert data == {"hash": base62.encode(START_ID + index),
+                        "short_url": f"https://localhost.local:8444/{base62.encode(START_ID + index)}"}
+        assert base62.decode(data["hash"]) == START_ID + index
     with connection() as conn:
         assert [r["id"] for r in conn.execute("SELECT id FROM urls ORDER BY id")] == list(range(START_ID, START_ID + 3))
+
+
+def test_both_apps_use_library_and_preserve_legacy_hash(clients, monkeypatch):
+    one, two = clients(app1), clients()
+    monkeypatch.setattr(grpc_client, "log_visit", Mock(return_value=True))
+    # Hash literal obtenido de la implementación anterior, almacenado antes del POST.
+    with connection() as conn:
+        conn.execute("INSERT INTO urls (hash, long_url) VALUES (?, ?)",
+                     ("eRgfR", "https://example.com/legacy"))
+    encoder = Mock(wraps=base62.encode)
+    monkeypatch.setattr(base62, "encode", encoder)
+    for client, status in ((one, 302), (two, 301)):
+        response = client.get("/eRgfR")
+        assert response.status_code == status
+        assert response.headers["location"] == "https://example.com/legacy"
+        shorten(client)
+    assert [call.args for call in encoder.call_args_list] == [(START_ID + 1,), (START_ID + 2,)]
 
 
 @pytest.mark.parametrize("url", ["http://example.com/ruta?q=1#x", "https://example.com/ruta"])
@@ -95,7 +112,7 @@ def test_permanent_redirect_location_and_no_grpc(clients, url):
         assert response.headers["location"] == url
     grpc_client.log_visit.assert_not_called()
     with connection() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'visits'").fetchone()[0] == 0
 
 
 def test_cache_reduces_sqlite_queries_and_expires(clients, selects, advance_clock, monkeypatch):
@@ -212,7 +229,7 @@ def test_apps_independent_with_shared_persistence(clients, monkeypatch, selects)
     two = clients()
     first, second = shorten(one), shorten(two)
     assert first["short_url"] == "https://localhost.local:8443/eRgfR"
-    assert second["hash"] == encode(START_ID + 1)
+    assert second["hash"] == base62.encode(START_ID + 1)
     assert two.get(f"/{first['hash']}").status_code == 301
     assert two.get(f"/{first['hash']}").status_code == 429
     for _ in range(4):
@@ -238,7 +255,7 @@ def test_concurrent_creation_across_both_apps(clients):
     one, two = clients(app1), clients()
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(lambda n: shorten(one if n % 2 else two), range(16)))
-    ids = sorted(decode(data["hash"]) for data in results)
+    ids = sorted(base62.decode(data["hash"]) for data in results)
     assert ids == list(range(START_ID, START_ID + 16))
 
 

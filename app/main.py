@@ -50,7 +50,7 @@ def redirect(short_hash: FromPath[str], request: Request) -> Redirect:
     short_url = f"{_base_url(request)}/{row['hash']}"
     grpc_client.log_visit(short_url, row["long_url"])
 
-    return Redirect(path=row["long_url"], status_code=302)
+    return Redirect(path=row["long_url"], status_code=302, headers={"Cache-Control":"no-store"},)
 
 
 app = Litestar(

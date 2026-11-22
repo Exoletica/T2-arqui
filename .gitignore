@@ -15,3 +15,4 @@ htmlcov/
 .vscode/
 .*/
 certs/
+db_backups/

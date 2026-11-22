@@ -1,7 +1,7 @@
 """Operaciones SQLite y Base62 comunes; no dependen de HTTP ni de gRPC."""
 import uuid
 
-from app.base62 import encode
+import base62
 from app.db import connection
 
 
@@ -13,7 +13,7 @@ def create_url(long_url: str) -> str:
             (placeholder, long_url),
         )
         url_id = cursor.lastrowid
-        short_hash = encode(url_id)
+        short_hash = base62.encode(url_id)
         conn.execute("UPDATE urls SET hash = ? WHERE id = ?", (short_hash, url_id))
     return short_hash
 

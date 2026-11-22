@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
 from litestar.testing import TestClient  # noqa: E402
 
 from app import grpc_client  # noqa: E402
-from app.base62 import decode, encode  # noqa: E402
+import base62  # noqa: E402
 from app.db import START_ID, connection, init_db  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -40,7 +40,7 @@ def test_shorten_returns_hash_and_short_url(client):
     assert response.status_code == 201
     data = response.json()
     assert data["hash"]
-    assert decode(data["hash"]) >= START_ID
+    assert base62.decode(data["hash"]) >= START_ID
     assert data["short_url"].endswith(data["hash"])
 
 
@@ -52,6 +52,7 @@ def test_redirect_returns_302_and_logs_visit(client, logged_visits):
     response = client.get(f"/{created['hash']}", follow_redirects=False)
 
     assert response.status_code == 302
+    assert response.headers["cache-control"] == "no-store"
     assert response.headers["location"] == "https://example.com/destino"
     assert logged_visits == [
         (created["short_url"], "https://example.com/destino")
@@ -123,11 +124,15 @@ def test_startup_preserves_existing_data_and_sequence(tmp_path, monkeypatch, log
     db_file = tmp_path / "existing.db"
     monkeypatch.setenv("DB_PATH", str(db_file))
     init_db()
+    from logs_service.db import init_log_db, log_connection
+    monkeypatch.setenv("LOG_DB_PATH", str(tmp_path / "visits.db"))
+    init_log_db()
     with connection() as conn:
         conn.execute(
             "INSERT INTO urls (hash, long_url) VALUES (?, ?)",
-            (encode(START_ID), "https://example.com/existing"),
+            (base62.encode(START_ID), "https://example.com/existing"),
         )
+    with log_connection() as conn:
         conn.execute(
             "INSERT INTO visits (timestamp, short_url, long_url) VALUES (?, ?, ?)",
             (1700000000, "http://localhost/eRgfR", "https://example.com/existing"),
@@ -139,9 +144,10 @@ def test_startup_preserves_existing_data_and_sequence(tmp_path, monkeypatch, log
             assert response.headers["location"] == "https://example.com/existing"
             created = client.post("/shorten", json={"long_url": "https://example.com/new"})
             assert created.status_code == 201
-            assert created.json()["hash"] == encode(expected_id)
+            assert created.json()["hash"] == base62.encode(expected_id)
     with connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0] == 3
+    with log_connection() as conn:
         assert conn.execute("SELECT timestamp FROM visits").fetchone()[0] == 1700000000
 
 

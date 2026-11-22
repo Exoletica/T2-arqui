@@ -15,12 +15,6 @@ CREATE TABLE IF NOT EXISTS urls (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS visits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,
-    short_url TEXT NOT NULL,
-    long_url TEXT NOT NULL
-);
 """
 
 

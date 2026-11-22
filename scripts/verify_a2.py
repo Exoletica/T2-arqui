@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 import grpc
 import httpx
 
-from app.base62 import encode
+import base62
 from app.db import START_ID
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,12 +66,13 @@ def verify():
         # Verifica confianza y SAN: no utiliza verify=False ni curl -k.
         tls = ssl.create_default_context(cafile=str(certs / "localhost.crt"))
         db_file = directory / "integration.db"
+        log_db_file = directory / "visits.db"
         grpc_port, a1_port, a2_port = free_port(), free_port(), free_port()
         while len({grpc_port, a1_port, a2_port}) != 3:
             grpc_port, a1_port, a2_port = free_port(), free_port(), free_port()
         env = {
             **os.environ, "DB_PATH": str(db_file), "GRPC_PORT": str(grpc_port),
-            "GRPC_TARGET": f"127.0.0.1:{grpc_port}",
+            "GRPC_TARGET": f"127.0.0.1:{grpc_port}", "LOG_DB_PATH": str(log_db_file),
             "A2_RATE_LIMIT_PER_MINUTE": "12", "A2_CACHE_TTL_SECONDS": "2",
         }
         logs = []
@@ -86,7 +87,7 @@ def verify():
             return process
 
         try:
-            launch("grpc", ["-m", "logs_service.server"])
+            grpc_process = launch("grpc", ["-m", "logs_service.server"])
             with grpc.insecure_channel(env["GRPC_TARGET"]) as channel:
                 grpc.channel_ready_future(channel).result(timeout=15)
 
@@ -113,10 +114,37 @@ def verify():
                 response = client.post("/shorten", json={"long_url": original})
                 assert response.status_code == 201, response.text
                 data = response.json()
-                assert data["hash"] == encode(START_ID + index)
+                assert data["hash"] == base62.encode(START_ID + index)
                 assert data["short_url"] == f"{str(client.base_url).rstrip('/')}/{data['hash']}"
                 created.append(data)
             first_hash, second_hash = [data["hash"] for data in created]
+            for _ in range(3):
+                response = check_redirect(one, first_hash, 302, original)
+                assert response.headers["cache-control"] == "no-store"
+                print(f"A1: {response.status_code}, Location={response.headers['location']}, Cache-Control={response.headers['cache-control']}")
+            with sqlite3.connect(db_file) as conn:
+                assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='visits'").fetchone()[0] == 0
+            with sqlite3.connect(log_db_file) as conn:
+                conn.row_factory = sqlite3.Row
+                events = conn.execute("SELECT * FROM visits ORDER BY id").fetchall()
+                assert len(events) == 3
+                assert len({row["id"] for row in events}) == 3
+                for row in events:
+                    assert row["timestamp"] > 0
+                    assert row["short_url"] == created[0]["short_url"]
+                    assert row["long_url"] == original
+                    print(f"Log DB {log_db_file}: {dict(row)}")
+                assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='urls'").fetchone()[0] == 0
+            # Reiniciar ambos componentes A1 conservando sus dos archivos.
+            stop(p1)
+            stop(grpc_process)
+            grpc_process = launch("grpc-restarted", ["-m", "logs_service.server"])
+            with grpc.insecure_channel(env["GRPC_TARGET"]) as channel:
+                grpc.channel_ready_future(channel).result(timeout=15)
+            p1 = launch("a1-restarted", web("app.main:app", a1_port))
+            wait_ready(one, p1)
+            with sqlite3.connect(log_db_file) as conn:
+                assert conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0] == 3
             check_redirect(one, second_hash, 302, original)
             check_redirect(two, first_hash, 301, original)
             check_redirect(two, first_hash, 301, original)
@@ -147,9 +175,9 @@ def verify():
             for path in ("/health", "/schema/swagger", "/schema/openapi.json"):
                 assert two.get(path).status_code == 200
             check_redirect(one, first_hash, 302, changed)
-            with sqlite3.connect(db_file) as conn:
+            with sqlite3.connect(log_db_file) as conn:
                 visits = conn.execute("SELECT short_url, long_url FROM visits ORDER BY id").fetchall()
-                assert visits == [
+                assert visits == [(created[0]["short_url"], original)] * 3 + [
                     (f"{str(one.base_url).rstrip('/')}/{second_hash}", original),
                     (f"{str(one.base_url).rstrip('/')}/{first_hash}", changed),
                 ], visits

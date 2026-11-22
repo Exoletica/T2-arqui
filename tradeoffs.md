@@ -21,13 +21,13 @@ no ofrece una operación para editar o eliminar destinos.
 
 A1 hace una llamada gRPC por GET válido que llega al servidor y persiste timestamp,
 URL corta y URL larga. El servicio separado permite desacoplar el registro del
-HTTP, pero consume conexiones, tiempo y recursos SQLite. La llamada es síncrona
+HTTP, pero consume conexiones, tiempo y recursos en su Log DB SQLite independiente. La llamada es síncrona
 con timeout (por defecto 1 segundo); su fallo no impide el 302. No hay reintentos
 durables: una caída pierde ese evento. Por ello tampoco garantiza analítica exacta.
 
 A2 no ejecuta llamadas gRPC. Reduce trabajo por redirección, especialmente en
-hits de caché, pero no ofrece analítica de visitas. Compartir SQLite no implica
-compartir el comportamiento de registro: A2 nunca escribe en `visits`.
+hits de caché, pero no ofrece analítica de visitas. A1 y A2 comparten Shortener DB; el registro utiliza una Log DB independiente.
+A2 nunca escribe en `visits`.
 
 ## 3. Caché del navegador frente a caché del servidor
 
@@ -93,10 +93,11 @@ La inserción provisional y su actualización Base62 ocurren en una misma
 transacción, como en A1. Los hashes existentes no se recalculan.
 
 WAL favorece lecturas concurrentes mientras hay un escritor. SQLite mantiene un
-solo escritor a la vez; POST y registros de visitas compiten por escritura. Los
+solo escritor a la vez; Los POST de A1 y A2 compiten por escritura en Shortener DB; los registros
+de visitas escriben en otra SQLite y no compiten por su mismo bloqueo. Los
 timeouts existentes amortiguan contención breve, pero no eliminan el límite de
-capacidad. Ambas aplicaciones y gRPC deben utilizar el mismo DB_PATH si se desea
-compartir datos; con rutas distintas la persistencia se separa y los hashes
+capacidad. Ambas aplicaciones deben utilizar el mismo DB_PATH si se desea
+compartir URLs; gRPC usa LOG_DB_PATH con su propia tabla visits; con rutas distintas la persistencia se separa y los hashes
 podrían coincidir entre archivos. Esta elección sirve para una tarea o despliegue
 local pequeño; múltiples máquinas requerirían revisar la persistencia.
 
