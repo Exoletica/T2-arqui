@@ -1,149 +1,37 @@
 # INF326 — Trade-offs de las dos arquitecturas
 
 Ambas implementaciones utilizan Litestar, SQLite y el mismo alfabeto Base62.
-Las diferencias siguientes son decisiones de este proyecto; no constituyen un
-benchmark de rendimiento. No se modificó el contrato gRPC ni el mecanismo de IDs.
 
 ## 1. HTTP 302 frente a HTTP 301
 
-A1 responde 302: comunica una redirección temporal y permite que solicitudes
-posteriores vuelvan a pasar por el acortador. Esto favorece cambios futuros del
-destino y observación de visitas, aunque la política efectiva de caché depende
-también del cliente y de las cabeceras HTTP.
+La principal diferencia entre ambas arquitecturas está en cómo se manejan las redirecciones y qué sucede cuando un usuario vuelve a utilizar una URL corta.
 
-A2 responde 301: declara permanente la asociación. Navegadores y proxies pueden
-reutilizarla y no volver a consultar el acortador, reduciendo tráfico y latencia.
-Cambiar el destino posteriormente es difícil: invalidar la caché del servidor
-no invalida una redirección ya retenida por un navegador. La aplicación actual
-no ofrece una operación para editar o eliminar destinos.
+En la **Arquitectura 1 (A1)** se utiliza el código HTTP 302, que indica una redirección temporal. Esto permite que el navegador vuelva a consultar al acortador cada vez que se utiliza el enlace, especialmente porque la aplicación incorpora la cabecera `Cache-Control: no-store`. Su principal ventaja es que facilita el registro de visitas y permitiría modificar el destino de los enlaces en el futuro. Sin embargo, como desventaja significa que el servidor debe atender más solicitudes, y por lo tanto, su carga de trabajo.
+
+Por otra parte, la **Arquitectura 2 (A2)** utiliza el código HTTP 301, que indica una redirección permanente. Esto permite que los navegadores guarden la redirección en su caché, evitando consultar nuevamente al acortador en algunas visitas. Como resultado, se puede reducir el tráfico hacia el servidor y mejorar los tiempos de respuesta. Pero esta ventaja también tiene una desventaja: si en el futuro se necesita cambiar la dirección original, algunos navegadores podrían seguir utilizando la redirección que guardaron anteriormente. Por eso, A2 resulta más adecuada para enlaces cuyo destino se espera que permanezca estable.
 
 ## 2. Registro gRPC frente a ausencia de registro por visita
 
-A1 hace una llamada gRPC por GET válido que llega al servidor y persiste timestamp,
-URL corta y URL larga. El servicio separado permite desacoplar el registro del
-HTTP, pero consume conexiones, tiempo y recursos en su Log DB SQLite independiente. La llamada es síncrona
-con timeout (por defecto 1 segundo); su fallo no impide el 302. No hay reintentos
-durables: una caída pierde ese evento. Por ello tampoco garantiza analítica exacta.
+Otra diferencia entre ambas arquitecturas es la manera en que manejan la información de las visitas realizadas a los enlaces.
 
-A2 no ejecuta llamadas gRPC. Reduce trabajo por redirección, especialmente en
-hits de caché, pero no ofrece analítica de visitas. A1 y A2 comparten Shortener DB; el registro utiliza una Log DB independiente.
-A2 nunca escribe en `visits`.
+En la Arquitectura 1 (A1), cada vez que llega una solicitud válida de redirección, se envía un mensaje mediante gRPC a un servicio encargado de registrar la visita. Este servicio guarda la fecha y hora mediante un timestamp, junto con la URL corta y su dirección original, en una base de datos SQLite independiente (visits.db). Esta separación permite mantener el registro de visitas como una responsabilidad distinta del acortador. Sin embargo, también requiere recursos adicionales y puede aumentar el tiempo de respuesta, ya que la llamada gRPC se realiza antes de completar la redirección. Si el servicio de registro no responde, A1 continúa con la redirección HTTP 302 después del fallo o del tiempo de espera configurado, que por defecto es de un segundo. En ese caso, la visita no queda registrada, porque actualmente no existe un mecanismo de reintentos.
 
-## 3. Caché del navegador frente a caché del servidor
+En cambio, la Arquitectura 2 (A2) no utiliza gRPC ni registra cada visita. Esto simplifica su funcionamiento y reduce el trabajo necesario para responder a las solicitudes, especialmente cuando puede utilizar una respuesta almacenada en caché. Su principal desventaja es que no proporciona información sobre cuántas veces se utilizan los enlaces.
 
-La caché del navegador puede evitar completamente una nueva solicitud de red
-al acortador. Su comportamiento depende del cliente y una redirección permanente
-puede persistir más allá del TTL configurado en A2.
+Por lo tanto, A1 resulta más conveniente cuando es importante conocer el uso de los enlaces, mientras que A2 es una alternativa más sencilla cuando se busca reducir el trabajo del servidor y no se necesita registrar cada visita.
 
-La caché del servidor actúa cuando una solicitud sí llega a Litestar. En A2 guarda
-la respuesta 301 por hash durante 300 segundos por defecto y evita repetir el
-SELECT a SQLite. No evita el transporte HTTPS ni el middleware de cuota.
-El TTL de servidor no controla ni promete el TTL del navegador. Las pruebas
-utilizan clientes que no siguen automáticamente redirecciones ni las retienen,
-para poder observar de forma independiente el comportamiento del servidor.
+## 3. Beneficios y costos del rate limiter
 
-## 4. Beneficios y costos del rate limiter
+La Arquitectura 2 incorpora un **rate limiter**, cuya función es controlar la cantidad de solicitudes que puede realizar un cliente durante un período determinado.
 
-El límite de A2 protege la base y la aplicación frente a ráfagas de solicitudes,
-incluidos POST, búsquedas inexistentes y hits de caché. Responde 429 antes de
-consultar SQLite o servir la redirección. Un cliente puede reintentar tras el
-reinicio indicado en las cabeceras `RateLimit-*`.
+Esta medida ayuda a proteger la aplicación frente a un número excesivo de peticiones, evitando que el servidor y la base de datos reciban una carga innecesaria. En la implementación, el límite predeterminado es de 60 solicitudes por minuto por dirección IP y se aplica tanto a la creación de URLs como a las redirecciones, incluso cuando estas se encuentran almacenadas en caché.
 
-El costo incluye consultar/actualizar el contador, sincronizar accesos y reservar
-memoria. La IP no equivale a una persona: usuarios de una red universitaria con
-NAT pueden compartir cuota, mientras que un atacante con varias IP podría
-repartir solicitudes. La ventana de un minuto permite ráfagas alrededor de sus
-límites. No se confía en X-Forwarded-For; un proxy de producción requiere una
-configuración explícita de confianza para preservar la identidad correcta.
+Cuando un cliente supera el límite permitido, el servidor responde con el código HTTP 429, indicando que se han realizado demasiadas solicitudes. Sin embargo, la protección también presenta algunas limitaciones. Por ejemplo, en una universidad es común que varios estudiantes utilicen una misma red y compartan una dirección IP pública. En ese caso, todos podrían consumir una misma cuota, provocando que algunos usuarios sean bloqueados temporalmente aunque individualmente hayan realizado pocas solicitudes. Por otra parte, una persona que utilice distintas direcciones IP podría distribuir sus peticiones y evitar parte de esta restricción.
 
-## 5. Rendimiento frente a capacidad de obtener analítica
+## 4. Escenarios recomendados para una institución como la USM
 
-A2 reduce lecturas de SQLite gracias a la caché y elimina el RPC por visita; el
-301 también puede reducir solicitudes que llegan al servidor. A1 conserva más
-puntos de observación, pagando una lectura y una llamada RPC por visita válida.
-La prueba automatizada demuestra reducción de consultas; no mide percentiles de
-latencia ni rendimiento bajo carga. Para cuantificar la mejora se necesitaría
-un benchmark representativo, con aciertos/fallos de caché y cuotas comparables.
+Si la USM necesitara implementar un servicio de acortamiento de URLs, la elección entre ambas arquitecturas dependería principalmente del uso que se dará a los enlaces.
 
-## 6. Caché y cuotas en memoria
+Se recomendaría la **Arquitectura 1** para campañas de eventos o publicaciones donde sea importante conocer la cantidad de visitas recibidas. Su sistema de registro mediante gRPC permitiría obtener información útil para evaluar el interés de los usuarios y apoyar futuras decisiones. También sería conveniente para enlaces cuyos destinos podrían cambiar más adelante. No obstante, la universidad tendría que considerar el mayor trabajo del servidor y que algunos registros podrían perderse si el servicio gRPC presenta fallos. Si se ampliara el análisis de visitas, también sería necesario establecer medidas para proteger y administrar adecuadamente esa información.
 
-Los dos MemoryStore de A2 se crean por aplicación y no comparten estado con A1.
-No requieren Redis ni otro servicio. Un reinicio elimina caché y cuotas, sin
-perder URLs persistidas. Cada proceso o worker tiene almacenes independientes:
-N workers pueden permitir aproximadamente N veces la cuota por cliente y no
-comparten aciertos de caché.
-
-La caché no tiene LRU ni un máximo de entradas. La implementación nativa elimina
-objetos vencidos al acceder a su clave; entradas antiguas que no se vuelven a
-consultar pueden permanecer en memoria. Un despliegue sostenido necesitaría
-limpieza periódica, capacidad acotada y, si se escala horizontalmente, un almacén
-compartido con cuota atómica. Los misses concurrentes también pueden repetir
-lecturas antes de que exista una respuesta cacheada (sin protección antiestampida).
-
-No se cachean POST ni errores: un hash inexistente que aparezca después será
-visible de inmediato, y una cuota agotada no contamina la redirección válida.
-Si alguien modifica directamente un destino en SQLite, A2 puede seguir ofreciendo
-el valor anterior hasta el TTL; la caché externa de un 301 podría durar más.
-
-## 7. SQLite compartido y concurrencia
-
-Compartir el archivo conserva un espacio único de IDs entre ambas arquitecturas.
-AUTOINCREMENT asigna IDs secuenciales y la restricción UNIQUE protege los hashes.
-La inserción provisional y su actualización Base62 ocurren en una misma
-transacción, como en A1. Los hashes existentes no se recalculan.
-
-WAL favorece lecturas concurrentes mientras hay un escritor. SQLite mantiene un
-solo escritor a la vez; Los POST de A1 y A2 compiten por escritura en Shortener DB; los registros
-de visitas escriben en otra SQLite y no compiten por su mismo bloqueo. Los
-timeouts existentes amortiguan contención breve, pero no eliminan el límite de
-capacidad. Ambas aplicaciones deben utilizar el mismo DB_PATH si se desea
-compartir URLs; gRPC usa LOG_DB_PATH con su propia tabla visits; con rutas distintas la persistencia se separa y los hashes
-podrían coincidir entre archivos. Esta elección sirve para una tarea o despliegue
-local pequeño; múltiples máquinas requerirían revisar la persistencia.
-
-## 8. Impacto de HTTPS
-
-TLS protege confidencialidad e integridad de las conexiones HTTP, incluidos los
-destinos enviados por POST. Añade negociación criptográfica, gestión/renovación
-de certificados y algo de CPU. La reutilización de conexiones amortigua parte del
-costo. No hace seguro el contenido de una URL ni restringe quién puede acortarla.
-
-El certificado local autofirmado incluye SAN para localhost y 127.0.0.1; los
-navegadores advierten sobre su emisor. La integración verifica confianza
-explícita y nombre de host, sin desactivar la validación TLS. En producción se
-usaría un certificado emitido por una CA confiable y una política de renovación.
-El gRPC interno conserva su contrato y transporte sin TLS en esta etapa local.
-A1 puede seguir ejecutándose por HTTP para mantener compatibilidad y pruebas.
-
-## 9. Escenarios recomendados para una institución como la USM
-
-Recomendaría A1 para campañas de admisión, actividades de extensión o enlaces
-institucionales que puedan necesitar cambios de destino y mediciones de uso.
-Se debe aceptar que el registro actual pierde eventos cuando gRPC falla y que
-no mide visitas que nunca llegan al servidor. Los datos de visitas requerirían
-políticas institucionales de acceso y retención si se amplía la analítica.
-
-Recomendaría A2 para enlaces estables de material público, documentación o
-recursos permanentes, cuando interesa reducir consultas y proteger capacidad.
-La institución debe aceptar menor observabilidad y la dificultad de revertir un
-301. Ajustaría la cuota a redes con NAT para evitar perjudicar a cursos completos
-que comparten IP. Para uso masivo o varios servidores revisaría SQLite y los
-almacenes de memoria antes de extrapolar esta implementación académica.
-
-## BONUS — Identificadores únicos en un entorno distribuido (solo propuesta)
-
-Una alternativa sería un ID de 64 bits tipo Snowflake: timestamp relativo a una
-época, identificador de nodo asignado de forma única y secuencia local dentro de
-cada unidad temporal. Codificar ese entero en el mismo alfabeto Base62 mantiene
-la idea de un hash derivado de ID, pero produciría enlaces de otra longitud.
-
-Cada nodo debería reservar un identificador mediante un coordinador o una
-configuración que garantice exclusividad. Si el reloj retrocede, el generador
-debe detenerse o esperar hasta recuperar el último instante válido; si se agota
-la secuencia, debe esperar la siguiente unidad temporal. También deben definirse
-persistencia del último estado, reutilización segura de nodos y comportamiento
-ante particiones. Estos costos operativos sustituyen la coordinación central de
-una secuencia SQLite y merecen pruebas específicas.
-
-La propuesta no se implementa: las dos aplicaciones siguen utilizando IDs SQLite
-desde 597652313, sin modificar datos ni hashes existentes.
+Por otra parte, se recomienda la **Arquitectura 2** para documentos material de consulta o páginas que no cambian frecuentemente. Su redirección HTTP 301 y el uso de caché permitirían reducir solicitudes y aprovechar mejor los recursos disponibles. Sin embargo, la universidad tendría que aceptar que esta arquitectura no registra cada visita y que modificar una redirección permanente puede resultar complicado cuando los navegadores ya la han almacenado. Además, sería importante ajustar el rate limiter considerando que numerosos estudiantes pueden compartir una misma dirección IP al utilizar las redes universitarias.
